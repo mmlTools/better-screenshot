@@ -1,6 +1,6 @@
 /*
-Plugin Name
-Copyright (C) <Year> <Developer> <Email Address>
+Better Screenshot - An OBS plugin to take screenshots with more control over the output.
+Copyright (C) <2026> <@MMLTECH> <https://www.youtube.com/@mmltech> <https://streamrsc.com>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -21,7 +21,6 @@ the Free Software Foundation; either version 2 of the License, or
 #include <QByteArray>
 #include <QCheckBox>
 #include <QComboBox>
-#include <QCoreApplication>
 #include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -29,7 +28,6 @@ the Free Software Foundation; either version 2 of the License, or
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFileDialog>
-#include <QFileInfo>
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QGroupBox>
@@ -62,7 +60,6 @@ the Free Software Foundation; either version 2 of the License, or
 #include <QWidget>
 #include <QCoreApplication>
 #include <QFileInfo>
-#include <QDir>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
@@ -81,7 +78,6 @@ static QPointer<QShortcut> g_shortcut;
 static QPointer<QNetworkAccessManager> g_network;
 static bool g_loaded_once = false;
 
-static bool g_screenshotPending = false;
 static bool g_screenshotCompleted = false;
 static QString g_lastScreenshotPath;
 
@@ -312,7 +308,6 @@ static bool capture_obs_image(QImage &image, QString &error)
 {
 	g_lastScreenshotPath.clear();
 	g_screenshotCompleted = false;
-	g_screenshotPending = true;
 
 	obs_frontend_take_screenshot();
 
@@ -323,8 +318,6 @@ static bool capture_obs_image(QImage &image, QString &error)
 		QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
 		QThread::msleep(10);
 	}
-
-	g_screenshotPending = false;
 
 	if (!g_screenshotCompleted) {
 		error = "OBS did not finish creating the screenshot within the timeout.";
@@ -672,7 +665,6 @@ static void on_frontend_event(enum obs_frontend_event event, void *private_data)
 		bfree(lastPathRaw);
 
 	g_screenshotCompleted = true;
-	g_screenshotPending = false;
 }
 
 static void setup_qt_plugin_paths()
