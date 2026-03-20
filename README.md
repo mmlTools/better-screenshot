@@ -24,7 +24,8 @@ Restart OBS → Tools → Better Screenshot
 Server Settings → Integrations → Webhooks → New Webhook → copy URL
 
 ## Important (Windows)
-Download: download link will be added soon
+Download: 
+https://streamrsc.com/uploads/files/OBS-Studio-QT-TLS.zip
 
 Place in:
 OBS-Studio/bin/64bit/tls/qschannelbackend.dll
