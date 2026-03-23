@@ -27,6 +27,7 @@ the Free Software Foundation; either version 2 of the License, or
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QFile>
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QGridLayout>
@@ -67,6 +68,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 struct BetterScreenshotSettings {
 	QString format = "png";
 	bool saveLocal = true;
+	bool deleteOriginalAfterSave = false;
 	QString savePath;
 	QString webhookUrl;
 	QString webhookMessage;
@@ -84,6 +86,7 @@ static QString g_lastScreenshotPath;
 static const char *CONFIG_ROOT = "better_screenshot";
 static const char *KEY_FORMAT = "format";
 static const char *KEY_SAVE_LOCAL = "save_local";
+static const char *KEY_DELETE_ORIGINAL_AFTER_SAVE = "delete_original_after_save";
 static const char *KEY_SAVE_PATH = "save_path";
 static const char *KEY_WEBHOOK_URL = "webhook_url";
 static const char *KEY_WEBHOOK_MESSAGE = "webhook_message";
@@ -201,6 +204,38 @@ static bool save_image_locally(const QImage &image, const QString &filePath, con
 	return true;
 }
 
+static bool delete_original_screenshot_file(const QString &originalPath, const QString &newFilePath, QString &error)
+{
+	const QString originalClean = QFileInfo(originalPath).absoluteFilePath();
+	const QString newClean = newFilePath.trimmed().isEmpty() ? QString()
+								 : QFileInfo(newFilePath).absoluteFilePath();
+
+	if (originalClean.isEmpty()) {
+		error = "Original OBS screenshot path is empty.";
+		return false;
+	}
+
+	if (!newClean.isEmpty() && originalClean.compare(newClean, Qt::CaseInsensitive) == 0) {
+		error = "Refusing to delete the output file because it matches the original screenshot path.";
+		return false;
+	}
+
+	QFile originalFile(originalClean);
+	if (!originalFile.exists()) {
+		error = QString("Original OBS screenshot was not found: %1")
+				.arg(QDir::toNativeSeparators(originalClean));
+		return false;
+	}
+
+	if (!originalFile.remove()) {
+		error = QString("Could not delete original OBS screenshot: %1")
+				.arg(QDir::toNativeSeparators(originalClean));
+		return false;
+	}
+
+	return true;
+}
+
 static bool send_to_discord_webhook(const QByteArray &imageBytes, const QString &filename, const QString &message,
 				    QString &error)
 {
@@ -259,16 +294,15 @@ static bool send_to_discord_webhook(const QByteArray &imageBytes, const QString 
 
 	QString sslErrorsText;
 
-	QObject::connect(reply, &QNetworkReply::sslErrors,
-			 [reply, &sslErrorsText](const QList<QSslError> &errors) {
-				 Q_UNUSED(reply);
+	QObject::connect(reply, &QNetworkReply::sslErrors, [reply, &sslErrorsText](const QList<QSslError> &errors) {
+		Q_UNUSED(reply);
 
-				 QStringList parts;
-				 for (const QSslError &err : errors)
-					 parts << err.errorString();
+		QStringList parts;
+		for (const QSslError &err : errors)
+			parts << err.errorString();
 
-				 sslErrorsText = parts.join(" | ");
-			 });
+		sslErrorsText = parts.join(" | ");
+	});
 
 	QEventLoop loop;
 	QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
@@ -389,8 +423,7 @@ static bool take_and_process_screenshot(QString &resultMessage)
 		}
 
 		QString webhookError;
-		if (!send_to_discord_webhook(encoded,
-					     fileName.isEmpty() ? QString("screenshot.%1").arg(ext) : fileName,
+		if (!send_to_discord_webhook(encoded, fileName.isEmpty() ? QString("screenshot.%1").arg(ext) : fileName,
 					     g_settings.webhookMessage, webhookError)) {
 			resultMessage = QString("Discord webhook upload failed: %1").arg(webhookError);
 			return false;
@@ -403,6 +436,17 @@ static bool take_and_process_screenshot(QString &resultMessage)
 	if (!didSomething) {
 		resultMessage = "Nothing to do. Enable local save and/or enter a Discord webhook URL.";
 		return false;
+	}
+
+	if (g_settings.deleteOriginalAfterSave) {
+		QString deleteError;
+		if (!delete_original_screenshot_file(g_lastScreenshotPath, g_settings.saveLocal ? filePath : QString(),
+						     deleteError)) {
+			resultMessage = QString("Screenshot processed, but cleanup failed: %1").arg(deleteError);
+			return false;
+		}
+
+		actions << "deleted original OBS PNG";
 	}
 
 	resultMessage = QString("Screenshot %1.").arg(actions.join(" and "));
@@ -452,6 +496,7 @@ static void settings_save_load_callback(obs_data_t *save_data, bool saving, void
 
 		obs_data_set_string(obj, KEY_FORMAT, g_settings.format.toUtf8().constData());
 		obs_data_set_bool(obj, KEY_SAVE_LOCAL, g_settings.saveLocal);
+		obs_data_set_bool(obj, KEY_DELETE_ORIGINAL_AFTER_SAVE, g_settings.deleteOriginalAfterSave);
 		obs_data_set_string(obj, KEY_SAVE_PATH, g_settings.savePath.toUtf8().constData());
 		obs_data_set_string(obj, KEY_WEBHOOK_URL, g_settings.webhookUrl.toUtf8().constData());
 		obs_data_set_string(obj, KEY_WEBHOOK_MESSAGE, g_settings.webhookMessage.toUtf8().constData());
@@ -467,6 +512,7 @@ static void settings_save_load_callback(obs_data_t *save_data, bool saving, void
 		if (!g_loaded_once) {
 			g_settings.format = "png";
 			g_settings.saveLocal = true;
+			g_settings.deleteOriginalAfterSave = false;
 			g_settings.savePath = default_save_path();
 			g_settings.webhookUrl.clear();
 			g_settings.webhookMessage.clear();
@@ -486,6 +532,7 @@ static void settings_save_load_callback(obs_data_t *save_data, bool saving, void
 
 	g_settings.format = (format && *format) ? QString::fromUtf8(format) : "png";
 	g_settings.saveLocal = obs_data_get_bool(obj, KEY_SAVE_LOCAL);
+	g_settings.deleteOriginalAfterSave = obs_data_get_bool(obj, KEY_DELETE_ORIGINAL_AFTER_SAVE);
 	g_settings.savePath = (savePath && *savePath) ? QString::fromUtf8(savePath) : default_save_path();
 	g_settings.webhookUrl = webhookUrl ? QString::fromUtf8(webhookUrl) : QString();
 	g_settings.webhookMessage = webhookMessage ? QString::fromUtf8(webhookMessage) : QString();
@@ -526,7 +573,8 @@ static void show_settings_dialog(void *private_data)
 	auto *captureGroup = new QGroupBox("Capture");
 	auto *captureLayout = new QFormLayout(captureGroup);
 
-	auto *hotkeyEdit = new QKeySequenceEdit(QKeySequence::fromString(g_settings.hotkey, QKeySequence::PortableText));
+	auto *hotkeyEdit =
+		new QKeySequenceEdit(QKeySequence::fromString(g_settings.hotkey, QKeySequence::PortableText));
 	hotkeyEdit->setClearButtonEnabled(true);
 
 	auto *formatCombo = new QComboBox();
@@ -547,13 +595,19 @@ static void show_settings_dialog(void *private_data)
 	auto *saveLocalCheck = new QCheckBox("Save image locally");
 	saveLocalCheck->setChecked(g_settings.saveLocal);
 
+	auto *deleteOriginalCheck = new QCheckBox("Delete original image after save");
+	deleteOriginalCheck->setChecked(g_settings.deleteOriginalAfterSave);
+	deleteOriginalCheck->setToolTip(
+		"Deletes the PNG file generated by OBS after the new image has been processed successfully.");
+
 	auto *pathEdit = new QLineEdit(g_settings.savePath.isEmpty() ? default_save_path() : g_settings.savePath);
 	auto *browseButton = new QPushButton("Browse...");
 
 	localLayout->addWidget(saveLocalCheck, 0, 0, 1, 3);
-	localLayout->addWidget(new QLabel("Folder"), 1, 0);
-	localLayout->addWidget(pathEdit, 1, 1);
-	localLayout->addWidget(browseButton, 1, 2);
+	localLayout->addWidget(deleteOriginalCheck, 1, 0, 1, 3);
+	localLayout->addWidget(new QLabel("Folder"), 2, 0);
+	localLayout->addWidget(pathEdit, 2, 1);
+	localLayout->addWidget(browseButton, 2, 2);
 
 	auto *discordGroup = new QGroupBox("Discord webhook");
 	auto *discordLayout = new QFormLayout(discordGroup);
@@ -574,10 +628,11 @@ static void show_settings_dialog(void *private_data)
 	rootLayout->addWidget(discordGroup);
 	rootLayout->addWidget(buttons);
 
-	auto updateLocalUi = [saveLocalCheck, pathEdit, browseButton]() {
+	auto updateLocalUi = [saveLocalCheck, deleteOriginalCheck, pathEdit, browseButton]() {
 		const bool enabled = saveLocalCheck->isChecked();
 		pathEdit->setEnabled(enabled);
 		browseButton->setEnabled(enabled);
+		deleteOriginalCheck->setEnabled(enabled);
 	};
 
 	updateLocalUi();
@@ -598,52 +653,54 @@ static void show_settings_dialog(void *private_data)
 
 	QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
 
-	QObject::connect(buttons, &QDialogButtonBox::accepted,
-			 &dialog,
-			 [&dialog, hotkeyEdit, formatCombo, saveLocalCheck, pathEdit, webhookEdit, messageEdit]() {
-				 const QString selectedFormat = formatCombo->currentText().trimmed().toLower();
-				 const QString selectedPath = pathEdit->text().trimmed();
-				 const QString selectedWebhook = webhookEdit->text().trimmed();
+	QObject::connect(
+		buttons, &QDialogButtonBox::accepted, &dialog,
+		[&dialog, hotkeyEdit, formatCombo, saveLocalCheck, deleteOriginalCheck, pathEdit, webhookEdit,
+		 messageEdit]() {
+			const QString selectedFormat = formatCombo->currentText().trimmed().toLower();
+			const QString selectedPath = pathEdit->text().trimmed();
+			const QString selectedWebhook = webhookEdit->text().trimmed();
 
-				 if (saveLocalCheck->isChecked() && selectedPath.isEmpty()) {
-					 QMessageBox::warning(&dialog, "Better Screenshot", "Please choose a local folder.");
-					 return;
-				 }
+			if (saveLocalCheck->isChecked() && selectedPath.isEmpty()) {
+				QMessageBox::warning(&dialog, "Better Screenshot", "Please choose a local folder.");
+				return;
+			}
 
-				 if (saveLocalCheck->isChecked()) {
-					 QString effectivePath = selectedPath.isEmpty() ? default_save_path() : selectedPath;
-					 QDir dir(effectivePath);
-					 if (!dir.exists() && !dir.mkpath(".")) {
-						 QMessageBox::warning(
-							 &dialog, "Better Screenshot",
-							 QString("Could not create folder: %1")
-								 .arg(QDir::toNativeSeparators(dir.absolutePath())));
-						 return;
-					 }
-				 }
+			if (saveLocalCheck->isChecked()) {
+				QString effectivePath = selectedPath.isEmpty() ? default_save_path() : selectedPath;
+				QDir dir(effectivePath);
+				if (!dir.exists() && !dir.mkpath(".")) {
+					QMessageBox::warning(
+						&dialog, "Better Screenshot",
+						QString("Could not create folder: %1")
+							.arg(QDir::toNativeSeparators(dir.absolutePath())));
+					return;
+				}
+			}
 
-				 if (!selectedWebhook.isEmpty()) {
-					 const QUrl url(selectedWebhook);
-					 if (!url.isValid() || url.scheme().isEmpty() || url.host().isEmpty()) {
-						 QMessageBox::warning(&dialog, "Better Screenshot",
-								      "Please enter a valid Discord webhook URL.");
-						 return;
-					 }
-				 }
+			if (!selectedWebhook.isEmpty()) {
+				const QUrl url(selectedWebhook);
+				if (!url.isValid() || url.scheme().isEmpty() || url.host().isEmpty()) {
+					QMessageBox::warning(&dialog, "Better Screenshot",
+							     "Please enter a valid Discord webhook URL.");
+					return;
+				}
+			}
 
-				 g_settings.hotkey =
-					 hotkeyEdit->keySequence().toString(QKeySequence::PortableText).trimmed();
-				 g_settings.format = selectedFormat.isEmpty() ? QString("png") : selectedFormat;
-				 g_settings.saveLocal = saveLocalCheck->isChecked();
-				 g_settings.savePath = selectedPath.isEmpty() ? default_save_path() : selectedPath;
-				 g_settings.webhookUrl = selectedWebhook;
-				 g_settings.webhookMessage = messageEdit->toPlainText();
+			g_settings.hotkey = hotkeyEdit->keySequence().toString(QKeySequence::PortableText).trimmed();
+			g_settings.format = selectedFormat.isEmpty() ? QString("png") : selectedFormat;
+			g_settings.saveLocal = saveLocalCheck->isChecked();
+			g_settings.deleteOriginalAfterSave = saveLocalCheck->isChecked() &&
+							     deleteOriginalCheck->isChecked();
+			g_settings.savePath = selectedPath.isEmpty() ? default_save_path() : selectedPath;
+			g_settings.webhookUrl = selectedWebhook;
+			g_settings.webhookMessage = messageEdit->toPlainText();
 
-				 rebuild_shortcut();
-				 obs_frontend_save();
+			rebuild_shortcut();
+			obs_frontend_save();
 
-				 dialog.accept();
-			 });
+			dialog.accept();
+		});
 
 	dialog.exec();
 }
