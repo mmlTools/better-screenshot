@@ -21,6 +21,7 @@ the Free Software Foundation; either version 2 of the License, or
 #include <QByteArray>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -29,6 +30,7 @@ the Free Software Foundation; either version 2 of the License, or
 #include <QEventLoop>
 #include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QGroupBox>
@@ -38,8 +40,6 @@ the Free Software Foundation; either version 2 of the License, or
 #include <QImageWriter>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QKeySequence>
-#include <QKeySequenceEdit>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -49,18 +49,16 @@ the Free Software Foundation; either version 2 of the License, or
 #include <QPlainTextEdit>
 #include <QPointer>
 #include <QPushButton>
-#include <QShortcut>
 #include <QSslConfiguration>
 #include <QSslError>
 #include <QSslSocket>
 #include <QStandardPaths>
 #include <QString>
 #include <QThread>
+#include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QWidget>
-#include <QCoreApplication>
-#include <QFileInfo>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
@@ -72,16 +70,15 @@ struct BetterScreenshotSettings {
 	QString savePath;
 	QString webhookUrl;
 	QString webhookMessage;
-	QString hotkey = "Ctrl+Shift+S";
 };
 
 static BetterScreenshotSettings g_settings;
-static QPointer<QShortcut> g_shortcut;
 static QPointer<QNetworkAccessManager> g_network;
-static bool g_loaded_once = false;
 
 static bool g_screenshotCompleted = false;
 static QString g_lastScreenshotPath;
+
+static obs_hotkey_id g_captureHotkeyId = OBS_INVALID_HOTKEY_ID;
 
 static const char *CONFIG_ROOT = "better_screenshot";
 static const char *KEY_FORMAT = "format";
@@ -90,7 +87,7 @@ static const char *KEY_DELETE_ORIGINAL_AFTER_SAVE = "delete_original_after_save"
 static const char *KEY_SAVE_PATH = "save_path";
 static const char *KEY_WEBHOOK_URL = "webhook_url";
 static const char *KEY_WEBHOOK_MESSAGE = "webhook_message";
-static const char *KEY_HOTKEY = "hotkey";
+static const char *KEY_CAPTURE_HOTKEY = "capture_hotkey";
 
 static QWidget *get_main_window_widget()
 {
@@ -464,27 +461,53 @@ static void capture_screenshot_now()
 	}
 }
 
-static void rebuild_shortcut()
+static void queue_capture_screenshot()
 {
-	if (g_shortcut) {
-		delete g_shortcut;
-		g_shortcut = nullptr;
+	QObject *context = get_main_window_widget();
+	if (!context)
+		context = qApp;
+
+	if (context) {
+		QTimer::singleShot(0, context, []() { capture_screenshot_now(); });
+	} else {
+		capture_screenshot_now();
 	}
+}
 
-	const QString hotkeyText = g_settings.hotkey.trimmed();
-	if (hotkeyText.isEmpty())
+static void capture_hotkey_callback(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(data);
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+
+	if (!pressed)
 		return;
 
-	QWidget *mainWindow = get_main_window_widget();
-	if (!mainWindow)
+	queue_capture_screenshot();
+}
+
+static void save_capture_hotkey(obs_data_t *save_data)
+{
+	if (g_captureHotkeyId == OBS_INVALID_HOTKEY_ID)
 		return;
 
-	g_shortcut = new QShortcut(QKeySequence::fromString(hotkeyText, QKeySequence::PortableText), mainWindow);
-	g_shortcut->setContext(Qt::ApplicationShortcut);
+	obs_data_array_t *hotkeyArray = obs_hotkey_save(g_captureHotkeyId);
+	if (hotkeyArray) {
+		obs_data_set_array(save_data, KEY_CAPTURE_HOTKEY, hotkeyArray);
+		obs_data_array_release(hotkeyArray);
+	}
+}
 
-	QObject::connect(g_shortcut, &QShortcut::activated, []() { capture_screenshot_now(); });
+static void load_capture_hotkey(obs_data_t *save_data)
+{
+	if (g_captureHotkeyId == OBS_INVALID_HOTKEY_ID)
+		return;
 
-	obs_log(LOG_INFO, "Better Screenshot hotkey set to %s", hotkeyText.toUtf8().constData());
+	obs_data_array_t *hotkeyArray = obs_data_get_array(save_data, KEY_CAPTURE_HOTKEY);
+	if (hotkeyArray) {
+		obs_hotkey_load(g_captureHotkeyId, hotkeyArray);
+		obs_data_array_release(hotkeyArray);
+	}
 }
 
 static void settings_save_load_callback(obs_data_t *save_data, bool saving, void *private_data)
@@ -500,43 +523,37 @@ static void settings_save_load_callback(obs_data_t *save_data, bool saving, void
 		obs_data_set_string(obj, KEY_SAVE_PATH, g_settings.savePath.toUtf8().constData());
 		obs_data_set_string(obj, KEY_WEBHOOK_URL, g_settings.webhookUrl.toUtf8().constData());
 		obs_data_set_string(obj, KEY_WEBHOOK_MESSAGE, g_settings.webhookMessage.toUtf8().constData());
-		obs_data_set_string(obj, KEY_HOTKEY, g_settings.hotkey.toUtf8().constData());
 
 		obs_data_set_obj(save_data, CONFIG_ROOT, obj);
 		obs_data_release(obj);
+
+		save_capture_hotkey(save_data);
 		return;
 	}
+
+	g_settings.format = "png";
+	g_settings.saveLocal = true;
+	g_settings.deleteOriginalAfterSave = false;
+	g_settings.savePath = default_save_path();
+	g_settings.webhookUrl.clear();
+	g_settings.webhookMessage.clear();
 
 	obs_data_t *obj = obs_data_get_obj(save_data, CONFIG_ROOT);
-	if (!obj) {
-		if (!g_loaded_once) {
-			g_settings.format = "png";
-			g_settings.saveLocal = true;
-			g_settings.deleteOriginalAfterSave = false;
-			g_settings.savePath = default_save_path();
-			g_settings.webhookUrl.clear();
-			g_settings.webhookMessage.clear();
-			g_settings.hotkey = "Ctrl+Shift+S";
+	if (obj) {
+		const char *format = obs_data_get_string(obj, KEY_FORMAT);
+		const char *savePath = obs_data_get_string(obj, KEY_SAVE_PATH);
+		const char *webhookUrl = obs_data_get_string(obj, KEY_WEBHOOK_URL);
+		const char *webhookMessage = obs_data_get_string(obj, KEY_WEBHOOK_MESSAGE);
 
-			rebuild_shortcut();
-			g_loaded_once = true;
-		}
-		return;
+		g_settings.format = (format && *format) ? QString::fromUtf8(format) : "png";
+		g_settings.saveLocal = obs_data_get_bool(obj, KEY_SAVE_LOCAL);
+		g_settings.deleteOriginalAfterSave = obs_data_get_bool(obj, KEY_DELETE_ORIGINAL_AFTER_SAVE);
+		g_settings.savePath = (savePath && *savePath) ? QString::fromUtf8(savePath) : default_save_path();
+		g_settings.webhookUrl = webhookUrl ? QString::fromUtf8(webhookUrl) : QString();
+		g_settings.webhookMessage = webhookMessage ? QString::fromUtf8(webhookMessage) : QString();
+
+		obs_data_release(obj);
 	}
-
-	const char *format = obs_data_get_string(obj, KEY_FORMAT);
-	const char *savePath = obs_data_get_string(obj, KEY_SAVE_PATH);
-	const char *webhookUrl = obs_data_get_string(obj, KEY_WEBHOOK_URL);
-	const char *webhookMessage = obs_data_get_string(obj, KEY_WEBHOOK_MESSAGE);
-	const char *hotkey = obs_data_get_string(obj, KEY_HOTKEY);
-
-	g_settings.format = (format && *format) ? QString::fromUtf8(format) : "png";
-	g_settings.saveLocal = obs_data_get_bool(obj, KEY_SAVE_LOCAL);
-	g_settings.deleteOriginalAfterSave = obs_data_get_bool(obj, KEY_DELETE_ORIGINAL_AFTER_SAVE);
-	g_settings.savePath = (savePath && *savePath) ? QString::fromUtf8(savePath) : default_save_path();
-	g_settings.webhookUrl = webhookUrl ? QString::fromUtf8(webhookUrl) : QString();
-	g_settings.webhookMessage = webhookMessage ? QString::fromUtf8(webhookMessage) : QString();
-	g_settings.hotkey = (hotkey && *hotkey) ? QString::fromUtf8(hotkey) : "Ctrl+Shift+S";
 
 	if (g_settings.format.isEmpty())
 		g_settings.format = "png";
@@ -544,13 +561,7 @@ static void settings_save_load_callback(obs_data_t *save_data, bool saving, void
 	if (g_settings.savePath.isEmpty())
 		g_settings.savePath = default_save_path();
 
-	if (g_settings.hotkey.isEmpty())
-		g_settings.hotkey = "Ctrl+Shift+S";
-
-	rebuild_shortcut();
-	g_loaded_once = true;
-
-	obs_data_release(obj);
+	load_capture_hotkey(save_data);
 }
 
 static void show_settings_dialog(void *private_data)
@@ -566,16 +577,18 @@ static void show_settings_dialog(void *private_data)
 	QDialog dialog(parent);
 	dialog.setWindowTitle("Better Screenshot");
 	dialog.setModal(true);
-	dialog.resize(640, 420);
+	dialog.resize(680, 480);
 
 	auto *rootLayout = new QVBoxLayout(&dialog);
 
 	auto *captureGroup = new QGroupBox("Capture");
 	auto *captureLayout = new QFormLayout(captureGroup);
 
-	auto *hotkeyEdit =
-		new QKeySequenceEdit(QKeySequence::fromString(g_settings.hotkey, QKeySequence::PortableText));
-	hotkeyEdit->setClearButtonEnabled(true);
+	auto *hotkeyInfo = new QLabel(
+		"Background hotkey handling is enabled through OBS hotkeys. Set the shortcut in OBS under <b>File → Settings → Hotkeys</b> using the action "
+		"<b>Better Screenshot: Capture Screenshot</b>.<br><br>");
+	hotkeyInfo->setWordWrap(true);
+	hotkeyInfo->setTextFormat(Qt::RichText);
 
 	auto *formatCombo = new QComboBox();
 	formatCombo->addItem("png");
@@ -586,7 +599,7 @@ static void show_settings_dialog(void *private_data)
 		formatCombo->setCurrentIndex(idx >= 0 ? idx : 0);
 	}
 
-	captureLayout->addRow("Hotkey", hotkeyEdit);
+	captureLayout->addRow(hotkeyInfo);
 	captureLayout->addRow("Image format", formatCombo);
 
 	auto *localGroup = new QGroupBox("Local save");
@@ -655,8 +668,7 @@ static void show_settings_dialog(void *private_data)
 
 	QObject::connect(
 		buttons, &QDialogButtonBox::accepted, &dialog,
-		[&dialog, hotkeyEdit, formatCombo, saveLocalCheck, deleteOriginalCheck, pathEdit, webhookEdit,
-		 messageEdit]() {
+		[&dialog, formatCombo, saveLocalCheck, deleteOriginalCheck, pathEdit, webhookEdit, messageEdit]() {
 			const QString selectedFormat = formatCombo->currentText().trimmed().toLower();
 			const QString selectedPath = pathEdit->text().trimmed();
 			const QString selectedWebhook = webhookEdit->text().trimmed();
@@ -687,7 +699,6 @@ static void show_settings_dialog(void *private_data)
 				}
 			}
 
-			g_settings.hotkey = hotkeyEdit->keySequence().toString(QKeySequence::PortableText).trimmed();
 			g_settings.format = selectedFormat.isEmpty() ? QString("png") : selectedFormat;
 			g_settings.saveLocal = saveLocalCheck->isChecked();
 			g_settings.deleteOriginalAfterSave = saveLocalCheck->isChecked() &&
@@ -696,9 +707,7 @@ static void show_settings_dialog(void *private_data)
 			g_settings.webhookUrl = selectedWebhook;
 			g_settings.webhookMessage = messageEdit->toPlainText();
 
-			rebuild_shortcut();
 			obs_frontend_save();
-
 			dialog.accept();
 		});
 
@@ -776,7 +785,17 @@ bool obs_module_load(void)
 	obs_frontend_add_save_callback(settings_save_load_callback, nullptr);
 	obs_frontend_add_event_callback(on_frontend_event, nullptr);
 
-	rebuild_shortcut();
+	g_captureHotkeyId = obs_hotkey_register_frontend(
+		"better_screenshot.capture", "Better Screenshot: Capture Screenshot", capture_hotkey_callback, nullptr);
+
+	if (g_captureHotkeyId == OBS_INVALID_HOTKEY_ID) {
+		obs_log(LOG_WARNING, "Failed to register Better Screenshot hotkey.");
+	} else {
+		obs_log(LOG_INFO, "Registered Better Screenshot hotkey id=%llu",
+			static_cast<unsigned long long>(g_captureHotkeyId));
+	}
+
+	obs_hotkey_enable_background_press(true);
 
 	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
 	return true;
@@ -787,9 +806,9 @@ void obs_module_unload(void)
 	obs_frontend_remove_save_callback(settings_save_load_callback, nullptr);
 	obs_frontend_remove_event_callback(on_frontend_event, nullptr);
 
-	if (g_shortcut) {
-		delete g_shortcut;
-		g_shortcut = nullptr;
+	if (g_captureHotkeyId != OBS_INVALID_HOTKEY_ID) {
+		obs_hotkey_unregister(g_captureHotkeyId);
+		g_captureHotkeyId = OBS_INVALID_HOTKEY_ID;
 	}
 
 	if (g_network) {
