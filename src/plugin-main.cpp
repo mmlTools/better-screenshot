@@ -70,6 +70,8 @@ struct BetterScreenshotSettings {
 	QString savePath;
 	QString webhookUrl;
 	QString webhookMessage;
+	bool webhookUseCustomFormat = false;
+	QString webhookFormat = "jpg";
 };
 
 static BetterScreenshotSettings g_settings;
@@ -87,6 +89,8 @@ static const char *KEY_DELETE_ORIGINAL_AFTER_SAVE = "delete_original_after_save"
 static const char *KEY_SAVE_PATH = "save_path";
 static const char *KEY_WEBHOOK_URL = "webhook_url";
 static const char *KEY_WEBHOOK_MESSAGE = "webhook_message";
+static const char *KEY_WEBHOOK_USE_CUSTOM_FORMAT = "webhook_use_custom_format";
+static const char *KEY_WEBHOOK_FORMAT = "webhook_format";
 static const char *KEY_CAPTURE_HOTKEY = "capture_hotkey";
 
 static QWidget *get_main_window_widget()
@@ -412,23 +416,38 @@ static bool take_and_process_screenshot(QString &resultMessage)
 	}
 
 	if (!g_settings.webhookUrl.trimmed().isEmpty()) {
+	const QString webhookFormat =
+		(g_settings.webhookUseCustomFormat && !g_settings.webhookFormat.trimmed().isEmpty())
+			? g_settings.webhookFormat.trimmed().toLower()
+			: g_settings.format.trimmed().toLower();
+
+		if (!format_supported(webhookFormat)) {
+		resultMessage = QString("The selected webhook image format \"%1\" is not supported.")
+			.arg(webhookFormat);
+			return false;
+	}
+
+	const QString webhookExt = normalized_extension(webhookFormat);
+	const QString baseName = QFileInfo(filePath).completeBaseName();
+	const QString webhookFileName =
+		QString("%1.%2").arg(baseName.isEmpty() ? QString("screenshot") : baseName, webhookExt);
+
 		QByteArray encoded;
 		QString encodeError;
-		if (!encode_image(image, g_settings.format, encoded, encodeError)) {
+		if (!encode_image(image, webhookFormat, encoded, encodeError)) {
 			resultMessage = QString("Webhook upload encoding failed: %1").arg(encodeError);
 			return false;
-		}
+	}
 
 		QString webhookError;
-		if (!send_to_discord_webhook(encoded, fileName.isEmpty() ? QString("screenshot.%1").arg(ext) : fileName,
-					     g_settings.webhookMessage, webhookError)) {
+		if (!send_to_discord_webhook(encoded, webhookFileName, g_settings.webhookMessage, webhookError)) {
 			resultMessage = QString("Discord webhook upload failed: %1").arg(webhookError);
 			return false;
-		}
+	}
 
 		didSomething = true;
-		actions << "sent to Discord webhook";
-	}
+		actions << QString("sent to Discord webhook as %1").arg(webhookExt.toUpper());
+}
 
 	if (!didSomething) {
 		resultMessage = "Nothing to do. Enable local save and/or enter a Discord webhook URL.";
@@ -523,6 +542,8 @@ static void settings_save_load_callback(obs_data_t *save_data, bool saving, void
 		obs_data_set_string(obj, KEY_SAVE_PATH, g_settings.savePath.toUtf8().constData());
 		obs_data_set_string(obj, KEY_WEBHOOK_URL, g_settings.webhookUrl.toUtf8().constData());
 		obs_data_set_string(obj, KEY_WEBHOOK_MESSAGE, g_settings.webhookMessage.toUtf8().constData());
+		obs_data_set_bool(obj, KEY_WEBHOOK_USE_CUSTOM_FORMAT, g_settings.webhookUseCustomFormat);
+		obs_data_set_string(obj, KEY_WEBHOOK_FORMAT, g_settings.webhookFormat.toUtf8().constData());
 
 		obs_data_set_obj(save_data, CONFIG_ROOT, obj);
 		obs_data_release(obj);
@@ -537,6 +558,8 @@ static void settings_save_load_callback(obs_data_t *save_data, bool saving, void
 	g_settings.savePath = default_save_path();
 	g_settings.webhookUrl.clear();
 	g_settings.webhookMessage.clear();
+	g_settings.webhookUseCustomFormat = false;
+	g_settings.webhookFormat = "jpg";
 
 	obs_data_t *obj = obs_data_get_obj(save_data, CONFIG_ROOT);
 	if (obj) {
@@ -544,6 +567,7 @@ static void settings_save_load_callback(obs_data_t *save_data, bool saving, void
 		const char *savePath = obs_data_get_string(obj, KEY_SAVE_PATH);
 		const char *webhookUrl = obs_data_get_string(obj, KEY_WEBHOOK_URL);
 		const char *webhookMessage = obs_data_get_string(obj, KEY_WEBHOOK_MESSAGE);
+		const char *webhookFormat = obs_data_get_string(obj, KEY_WEBHOOK_FORMAT);
 
 		g_settings.format = (format && *format) ? QString::fromUtf8(format) : "png";
 		g_settings.saveLocal = obs_data_get_bool(obj, KEY_SAVE_LOCAL);
@@ -551,12 +575,17 @@ static void settings_save_load_callback(obs_data_t *save_data, bool saving, void
 		g_settings.savePath = (savePath && *savePath) ? QString::fromUtf8(savePath) : default_save_path();
 		g_settings.webhookUrl = webhookUrl ? QString::fromUtf8(webhookUrl) : QString();
 		g_settings.webhookMessage = webhookMessage ? QString::fromUtf8(webhookMessage) : QString();
+		g_settings.webhookUseCustomFormat = obs_data_get_bool(obj, KEY_WEBHOOK_USE_CUSTOM_FORMAT);
+		g_settings.webhookFormat = (webhookFormat && *webhookFormat) ? QString::fromUtf8(webhookFormat) : "jpg";
 
 		obs_data_release(obj);
 	}
 
 	if (g_settings.format.isEmpty())
 		g_settings.format = "png";
+
+	if (g_settings.webhookFormat.isEmpty())
+		g_settings.webhookFormat = "jpg";
 
 	if (g_settings.savePath.isEmpty())
 		g_settings.savePath = default_save_path();
@@ -628,10 +657,28 @@ static void show_settings_dialog(void *private_data)
 	auto *webhookEdit = new QLineEdit(g_settings.webhookUrl);
 	webhookEdit->setPlaceholderText("https://discord.com/api/webhooks/...");
 
+	auto *webhookFormatCheck = new QCheckBox("Use separate webhook image format");
+	webhookFormatCheck->setChecked(g_settings.webhookUseCustomFormat);
+	webhookFormatCheck->setToolTip(
+		"When enabled, Discord uses this format instead of the main local image format.");
+
+	auto *webhookFormatCombo = new QComboBox();
+	webhookFormatCombo->addItem("png");
+	webhookFormatCombo->addItem("jpg");
+	webhookFormatCombo->addItem("webp");
+	{
+		const int idx = webhookFormatCombo->findText(g_settings.webhookFormat, Qt::MatchFixedString);
+		webhookFormatCombo->setCurrentIndex(idx >= 0 ? idx : 1);
+	}
+
+	webhookFormatCombo->setEnabled(webhookFormatCheck->isChecked());
+
 	auto *messageEdit = new QPlainTextEdit(g_settings.webhookMessage);
 	messageEdit->setPlaceholderText("Optional message to send with the screenshot");
 
 	discordLayout->addRow("Webhook URL", webhookEdit);
+	discordLayout->addRow(webhookFormatCheck);
+	discordLayout->addRow("Webhook image format", webhookFormatCombo);
 	discordLayout->addRow("Message", messageEdit);
 
 	auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
@@ -652,6 +699,11 @@ static void show_settings_dialog(void *private_data)
 
 	QObject::connect(saveLocalCheck, &QCheckBox::toggled, &dialog, [updateLocalUi]() { updateLocalUi(); });
 
+	QObject::connect(webhookFormatCheck, &QCheckBox::toggled, &dialog,
+		 [webhookFormatCombo](bool checked) {
+			 webhookFormatCombo->setEnabled(checked);
+		 });
+
 	QObject::connect(browseButton, &QPushButton::clicked, &dialog, [&dialog, pathEdit]() {
 		QString startDir = pathEdit->text().trimmed();
 		if (startDir.isEmpty())
@@ -668,10 +720,11 @@ static void show_settings_dialog(void *private_data)
 
 	QObject::connect(
 		buttons, &QDialogButtonBox::accepted, &dialog,
-		[&dialog, formatCombo, saveLocalCheck, deleteOriginalCheck, pathEdit, webhookEdit, messageEdit]() {
+		[&dialog, formatCombo, saveLocalCheck, deleteOriginalCheck, pathEdit, webhookEdit, webhookFormatCheck, webhookFormatCombo, messageEdit]() {
 			const QString selectedFormat = formatCombo->currentText().trimmed().toLower();
 			const QString selectedPath = pathEdit->text().trimmed();
 			const QString selectedWebhook = webhookEdit->text().trimmed();
+			const QString selectedWebhookFormat = webhookFormatCombo->currentText().trimmed().toLower();
 
 			if (saveLocalCheck->isChecked() && selectedPath.isEmpty()) {
 				QMessageBox::warning(&dialog, "Better Screenshot", "Please choose a local folder.");
@@ -699,6 +752,13 @@ static void show_settings_dialog(void *private_data)
 				}
 			}
 
+			if (webhookFormatCheck->isChecked() && !format_supported(selectedWebhookFormat)) {
+				QMessageBox::warning(&dialog, "Better Screenshot",
+					QString("The selected webhook image format \"%1\" is not supported.")
+				    	.arg(selectedWebhookFormat));
+				return;
+			}
+
 			g_settings.format = selectedFormat.isEmpty() ? QString("png") : selectedFormat;
 			g_settings.saveLocal = saveLocalCheck->isChecked();
 			g_settings.deleteOriginalAfterSave = saveLocalCheck->isChecked() &&
@@ -706,6 +766,8 @@ static void show_settings_dialog(void *private_data)
 			g_settings.savePath = selectedPath.isEmpty() ? default_save_path() : selectedPath;
 			g_settings.webhookUrl = selectedWebhook;
 			g_settings.webhookMessage = messageEdit->toPlainText();
+			g_settings.webhookUseCustomFormat = webhookFormatCheck->isChecked();
+			g_settings.webhookFormat = selectedWebhookFormat.isEmpty() ? QString("jpg") : selectedWebhookFormat;
 
 			obs_frontend_save();
 			dialog.accept();
