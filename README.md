@@ -24,11 +24,40 @@ Restart OBS → Tools → Better Screenshot
 Server Settings → Integrations → Webhooks → New Webhook → copy URL
 
 ## Important (Windows)
-Download: 
-https://streamrsc.com/uploads/files/OBS-Studio-QT-TLS.zip
+~~Download: 
+https://streamrsc.com/uploads/files/OBS-Studio-QT-TLS.zip~~
+> The link above no longer works. Use the workaround below instead.
 
-Place in:
-OBS-Studio/bin/64bit/tls/qschannelbackend.dll
+---
+Identify what Qt version OBS is using.
+
+In OBS, go to: 
+Help → Log Files → View Current Log
+
+Scroll up and look for **Qt version: x.x.x**
+
+---
+Download Qt Online Installer: 
+https://www.qt.io/download-qt-installer
+> A free account is needed
+
+In Qt installer, uncheck **Developer tools** and check **Custom Installation**. 
+
+Select the matching version for OBS
+
+Qt for Development 
+└─ Qt 
+└─ Qt x.x.x 
+└─ MSVC 20xx 64-bit
+
+---
+After installation, find your DLL here:
+
+C:/Qt/<Qt version>/msvc20xx_64/plugins/tls/qschannelbackend.dll
+
+Copy and paste **qschannelbackend.dll** in:
+
+obs-studio/bin/64bit/tls/qschannelbackend.dl
 
 ## Why Use It
 OBS saves only PNG (large files).
