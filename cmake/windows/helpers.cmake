@@ -63,6 +63,7 @@ function(target_install_resources target)
   message(DEBUG "Installing resources for target ${target}...")
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data")
     file(GLOB_RECURSE data_files "${CMAKE_CURRENT_SOURCE_DIR}/data/*")
+    list(FILTER data_files EXCLUDE REGEX "/data/obs-studio/")
     foreach(data_file IN LISTS data_files)
       cmake_path(
         RELATIVE_PATH
@@ -75,7 +76,12 @@ function(target_install_resources target)
       source_group("Resources/${relative_path}" FILES "${data_file}")
     endforeach()
 
-    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data/" DESTINATION "${target}/data" USE_SOURCE_PERMISSIONS)
+    install(
+      DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data/"
+      DESTINATION "${target}/data"
+      USE_SOURCE_PERMISSIONS
+      PATTERN "obs-studio" EXCLUDE
+    )
 
     add_custom_command(
       TARGET ${target}
