@@ -38,6 +38,7 @@ if(WIN32 AND ENABLE_QT)
   install(FILES
     "${CMAKE_SOURCE_DIR}/data/obs-studio/bin/64bit/tls/qschannelbackend.dll"
     DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit/tls"
+    OPTIONAL
   )
 endif()
 

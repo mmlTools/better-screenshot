@@ -46,6 +46,7 @@ the Free Software Foundation; either version 2 of the License, or
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QObject>
 #include <QPlainTextEdit>
 #include <QPointer>
 #include <QPushButton>
@@ -76,9 +77,13 @@ struct BetterScreenshotSettings {
 
 static BetterScreenshotSettings g_settings;
 static QPointer<QNetworkAccessManager> g_network;
+static QPointer<QObject> g_asyncContext;
 
 static bool g_screenshotCompleted = false;
 static QString g_lastScreenshotPath;
+static bool g_captureInProgress = false;
+static bool g_captureScheduled = false;
+static int g_pendingCaptures = 0;
 
 static obs_hotkey_id g_captureHotkeyId = OBS_INVALID_HOTKEY_ID;
 
@@ -92,6 +97,8 @@ static const char *KEY_WEBHOOK_MESSAGE = "webhook_message";
 static const char *KEY_WEBHOOK_USE_CUSTOM_FORMAT = "webhook_use_custom_format";
 static const char *KEY_WEBHOOK_FORMAT = "webhook_format";
 static const char *KEY_CAPTURE_HOTKEY = "capture_hotkey";
+
+static void configure_qt_tls_plugin_paths();
 
 static QWidget *get_main_window_widget()
 {
@@ -205,44 +212,73 @@ static bool save_image_locally(const QImage &image, const QString &filePath, con
 	return true;
 }
 
-static bool delete_original_screenshot_file(const QString &originalPath, const QString &newFilePath, QString &error)
+static bool validate_original_screenshot_cleanup(const QString &originalPath, const QString &newFilePath,
+						 QString &originalClean, QString &error)
 {
-	const QString originalClean = QFileInfo(originalPath).absoluteFilePath();
-	const QString newClean = newFilePath.trimmed().isEmpty() ? QString()
-								 : QFileInfo(newFilePath).absoluteFilePath();
-
-	if (originalClean.isEmpty()) {
+	if (originalPath.trimmed().isEmpty()) {
 		error = "Original OBS screenshot path is empty.";
 		return false;
 	}
+
+	originalClean = QFileInfo(originalPath).absoluteFilePath();
+	const QString newClean = newFilePath.trimmed().isEmpty() ? QString()
+								 : QFileInfo(newFilePath).absoluteFilePath();
 
 	if (!newClean.isEmpty() && originalClean.compare(newClean, Qt::CaseInsensitive) == 0) {
 		error = "Refusing to delete the output file because it matches the original screenshot path.";
 		return false;
 	}
 
-	QFile originalFile(originalClean);
+	return true;
+}
+
+static void attempt_original_screenshot_cleanup(const QString &originalPath, int attempt)
+{
+	QFile originalFile(originalPath);
 	if (!originalFile.exists()) {
-		error = QString("Original OBS screenshot was not found: %1")
-				.arg(QDir::toNativeSeparators(originalClean));
+		obs_log(LOG_INFO, "Original OBS screenshot no longer exists: %s",
+			originalPath.toUtf8().constData());
+		return;
+	}
+
+	if (originalFile.remove()) {
+		obs_log(LOG_INFO, "Deleted original OBS screenshot: %s", originalPath.toUtf8().constData());
+		return;
+	}
+
+	constexpr int maxAttempts = 8;
+	if (attempt >= maxAttempts || !g_asyncContext) {
+		obs_log(LOG_WARNING, "Could not delete original OBS screenshot after %d attempts: %s",
+			attempt, originalPath.toUtf8().constData());
+		return;
+	}
+
+	const int retryDelayMs = qMin(250 * attempt, 2000);
+	QTimer::singleShot(retryDelayMs, g_asyncContext, [originalPath, attempt]() {
+		attempt_original_screenshot_cleanup(originalPath, attempt + 1);
+	});
+}
+
+static bool schedule_original_screenshot_cleanup(const QString &originalPath, const QString &newFilePath,
+						 QString &error)
+{
+	QString originalClean;
+	if (!validate_original_screenshot_cleanup(originalPath, newFilePath, originalClean, error))
+		return false;
+
+	if (!g_asyncContext) {
+		error = "Screenshot cleanup service is not available.";
 		return false;
 	}
 
-	if (!originalFile.remove()) {
-		error = QString("Could not delete original OBS screenshot: %1")
-				.arg(QDir::toNativeSeparators(originalClean));
-		return false;
-	}
-
+	QTimer::singleShot(250, g_asyncContext,
+			   [originalClean]() { attempt_original_screenshot_cleanup(originalClean, 1); });
 	return true;
 }
 
 static bool send_to_discord_webhook(const QByteArray &imageBytes, const QString &filename, const QString &message,
 				    QString &error)
 {
-	if (!g_network)
-		g_network = new QNetworkAccessManager(get_main_window_widget());
-
 	const QUrl url(g_settings.webhookUrl.trimmed());
 	if (!url.isValid() || url.scheme().isEmpty() || url.host().isEmpty()) {
 		error = "The Discord webhook URL is not valid.";
@@ -254,6 +290,8 @@ static bool send_to_discord_webhook(const QByteArray &imageBytes, const QString 
 		return false;
 	}
 
+	configure_qt_tls_plugin_paths();
+
 	if (!QSslSocket::supportsSsl()) {
 		QStringList backends;
 #if QT_VERSION >= QT_VERSION_CHECK(6, 1, 0)
@@ -263,6 +301,9 @@ static bool send_to_discord_webhook(const QByteArray &imageBytes, const QString 
 				.arg(backends.isEmpty() ? QString("(none)") : backends.join(", "));
 		return false;
 	}
+
+	if (!g_network)
+		g_network = new QNetworkAccessManager(get_main_window_widget());
 
 	QNetworkRequest request(url);
 	request.setHeader(QNetworkRequest::UserAgentHeader, QVariant("Better Screenshot OBS Plugin"));
@@ -416,21 +457,21 @@ static bool take_and_process_screenshot(QString &resultMessage)
 	}
 
 	if (!g_settings.webhookUrl.trimmed().isEmpty()) {
-	const QString webhookFormat =
-		(g_settings.webhookUseCustomFormat && !g_settings.webhookFormat.trimmed().isEmpty())
-			? g_settings.webhookFormat.trimmed().toLower()
-			: g_settings.format.trimmed().toLower();
+		const QString webhookFormat =
+			(g_settings.webhookUseCustomFormat && !g_settings.webhookFormat.trimmed().isEmpty())
+				? g_settings.webhookFormat.trimmed().toLower()
+				: g_settings.format.trimmed().toLower();
 
 		if (!format_supported(webhookFormat)) {
-		resultMessage = QString("The selected webhook image format \"%1\" is not supported.")
-			.arg(webhookFormat);
+			resultMessage = QString("The selected webhook image format \"%1\" is not supported.")
+						.arg(webhookFormat);
 			return false;
-	}
+		}
 
-	const QString webhookExt = normalized_extension(webhookFormat);
-	const QString baseName = QFileInfo(filePath).completeBaseName();
-	const QString webhookFileName =
-		QString("%1.%2").arg(baseName.isEmpty() ? QString("screenshot") : baseName, webhookExt);
+		const QString webhookExt = normalized_extension(webhookFormat);
+		const QString baseName = QFileInfo(filePath).completeBaseName();
+		const QString webhookFileName =
+			QString("%1.%2").arg(baseName.isEmpty() ? QString("screenshot") : baseName, webhookExt);
 
 		QByteArray encoded;
 		QString encodeError;
@@ -447,7 +488,7 @@ static bool take_and_process_screenshot(QString &resultMessage)
 
 		didSomething = true;
 		actions << QString("sent to Discord webhook as %1").arg(webhookExt.toUpper());
-}
+	}
 
 	if (!didSomething) {
 		resultMessage = "Nothing to do. Enable local save and/or enter a Discord webhook URL.";
@@ -456,13 +497,13 @@ static bool take_and_process_screenshot(QString &resultMessage)
 
 	if (g_settings.deleteOriginalAfterSave) {
 		QString deleteError;
-		if (!delete_original_screenshot_file(g_lastScreenshotPath, g_settings.saveLocal ? filePath : QString(),
-						     deleteError)) {
+		if (!schedule_original_screenshot_cleanup(g_lastScreenshotPath,
+							 g_settings.saveLocal ? filePath : QString(), deleteError)) {
 			resultMessage = QString("Screenshot processed, but cleanup failed: %1").arg(deleteError);
 			return false;
 		}
 
-		actions << "deleted original OBS PNG";
+		actions << "queued original OBS PNG for cleanup";
 	}
 
 	resultMessage = QString("Screenshot %1.").arg(actions.join(" and "));
@@ -480,17 +521,39 @@ static void capture_screenshot_now()
 	}
 }
 
+static void process_next_capture()
+{
+	g_captureScheduled = false;
+
+	if (g_captureInProgress || g_pendingCaptures <= 0)
+		return;
+
+	--g_pendingCaptures;
+	g_captureInProgress = true;
+	capture_screenshot_now();
+	g_captureInProgress = false;
+
+	if (g_pendingCaptures > 0 && g_asyncContext) {
+		g_captureScheduled = true;
+		QTimer::singleShot(0, g_asyncContext, []() { process_next_capture(); });
+	}
+}
+
 static void queue_capture_screenshot()
 {
-	QObject *context = get_main_window_widget();
-	if (!context)
-		context = qApp;
+	++g_pendingCaptures;
 
-	if (context) {
-		QTimer::singleShot(0, context, []() { capture_screenshot_now(); });
-	} else {
-		capture_screenshot_now();
+	if (g_captureInProgress || g_captureScheduled)
+		return;
+
+	if (!g_asyncContext) {
+		--g_pendingCaptures;
+		obs_log(LOG_WARNING, "Cannot capture screenshot because the plugin task context is unavailable.");
+		return;
 	}
+
+	g_captureScheduled = true;
+	QTimer::singleShot(0, g_asyncContext, []() { process_next_capture(); });
 }
 
 static void capture_hotkey_callback(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -795,8 +858,13 @@ static void on_frontend_event(enum obs_frontend_event event, void *private_data)
 	g_screenshotCompleted = true;
 }
 
-static void setup_qt_plugin_paths()
+static void configure_qt_tls_plugin_paths()
 {
+	static bool configured = false;
+	if (configured)
+		return;
+
+	configured = true;
 	const QString appDir = QCoreApplication::applicationDirPath();
 
 	const char *modulePathRaw = obs_get_module_file_name(obs_current_module());
@@ -808,37 +876,26 @@ static void setup_qt_plugin_paths()
 		moduleDir = QFileInfo(modulePath).absolutePath();
 	}
 
-	obs_log(LOG_INFO, "Better Screenshot app dir: %s", appDir.toUtf8().constData());
-	obs_log(LOG_INFO, "Better Screenshot module path: %s",
-		modulePath.isEmpty() ? "(empty)" : modulePath.toUtf8().constData());
-	obs_log(LOG_INFO, "Better Screenshot module dir: %s",
-		moduleDir.isEmpty() ? "(empty)" : moduleDir.toUtf8().constData());
-
 	const QString appTlsDir = QDir(appDir).filePath("tls");
 	const QString moduleTlsDir = moduleDir.isEmpty() ? QString() : QDir(moduleDir).filePath("tls");
+	const QString appBackend = QDir(appTlsDir).filePath("qschannelbackend.dll");
+	const QString moduleBackend =
+		moduleTlsDir.isEmpty() ? QString() : QDir(moduleTlsDir).filePath("qschannelbackend.dll");
 
-	if (QDir(appTlsDir).exists()) {
+	if (QFileInfo::exists(appBackend)) {
 		QCoreApplication::addLibraryPath(appDir);
-		obs_log(LOG_INFO, "Added Qt library path from app dir: %s", appDir.toUtf8().constData());
-	} else {
-		obs_log(LOG_WARNING, "App tls folder not found: %s", appTlsDir.toUtf8().constData());
+		obs_log(LOG_INFO, "Configured Qt TLS backend from app dir: %s", appDir.toUtf8().constData());
 	}
 
-	if (!moduleDir.isEmpty() && QDir(moduleTlsDir).exists()) {
+	if (!moduleDir.isEmpty() && QFileInfo::exists(moduleBackend)) {
 		QCoreApplication::addLibraryPath(moduleDir);
-		obs_log(LOG_INFO, "Added Qt library path from module dir: %s", moduleDir.toUtf8().constData());
-	} else if (!moduleDir.isEmpty()) {
-		obs_log(LOG_WARNING, "Module tls folder not found: %s", moduleTlsDir.toUtf8().constData());
+		obs_log(LOG_INFO, "Configured Qt TLS backend from module dir: %s", moduleDir.toUtf8().constData());
 	}
-
-	const QStringList paths = QCoreApplication::libraryPaths();
-	for (const QString &path : paths)
-		obs_log(LOG_INFO, "Qt library path: %s", path.toUtf8().constData());
 }
 
 bool obs_module_load(void)
 {
-	setup_qt_plugin_paths();
+	g_asyncContext = new QObject();
 
 	if (g_settings.savePath.isEmpty())
 		g_settings.savePath = default_save_path();
@@ -865,6 +922,15 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	g_pendingCaptures = 0;
+	g_captureScheduled = false;
+	g_captureInProgress = false;
+
+	if (g_asyncContext) {
+		delete g_asyncContext;
+		g_asyncContext = nullptr;
+	}
+
 	obs_frontend_remove_save_callback(settings_save_load_callback, nullptr);
 	obs_frontend_remove_event_callback(on_frontend_event, nullptr);
 
