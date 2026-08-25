@@ -13,6 +13,7 @@ the Free Software Foundation; either version 2 of the License, or
 #include <obs-hotkey.h>
 #include "plugin-support.h"
 
+#include <util/config-file.h>
 #include <util/platform.h>
 #include <util/bmem.h>
 
@@ -87,6 +88,8 @@ static int g_pendingCaptures = 0;
 
 static obs_hotkey_id g_captureHotkeyId = OBS_INVALID_HOTKEY_ID;
 
+static const char *CAPTURE_HOTKEY_NAME = "better_screenshot.capture";
+
 static const char *CONFIG_ROOT = "better_screenshot";
 static const char *KEY_FORMAT = "format";
 static const char *KEY_SAVE_LOCAL = "save_local";
@@ -96,7 +99,11 @@ static const char *KEY_WEBHOOK_URL = "webhook_url";
 static const char *KEY_WEBHOOK_MESSAGE = "webhook_message";
 static const char *KEY_WEBHOOK_USE_CUSTOM_FORMAT = "webhook_use_custom_format";
 static const char *KEY_WEBHOOK_FORMAT = "webhook_format";
-static const char *KEY_CAPTURE_HOTKEY = "capture_hotkey";
+
+static inline QString T(const char *key)
+{
+	return QString::fromUtf8(obs_module_text(key));
+}
 
 static void configure_qt_tls_plugin_paths();
 
@@ -158,7 +165,7 @@ static bool encode_image(const QImage &image, const QString &format, QByteArray 
 {
 	QBuffer buffer(&encoded);
 	if (!buffer.open(QIODevice::WriteOnly)) {
-		error = "Could not open memory buffer for image encoding.";
+		error = T("Error.EncodeBufferFailed");
 		return false;
 	}
 
@@ -166,7 +173,7 @@ static bool encode_image(const QImage &image, const QString &format, QByteArray 
 	writer.setQuality(95);
 
 	if (!writer.write(image)) {
-		error = writer.errorString().isEmpty() ? "Image encoding failed." : writer.errorString();
+		error = writer.errorString().isEmpty() ? T("Error.EncodeFailed") : writer.errorString();
 		return false;
 	}
 
@@ -184,7 +191,7 @@ static bool ensure_output_folder_exists(QString &error)
 		return true;
 
 	if (!dir.mkpath(".")) {
-		error = QString("Could not create folder: %1").arg(QDir::toNativeSeparators(dir.absolutePath()));
+		error = T("Warn.CouldNotCreateFolder").arg(QDir::toNativeSeparators(dir.absolutePath()));
 		return false;
 	}
 
@@ -197,7 +204,7 @@ static bool save_image_locally(const QImage &image, const QString &filePath, con
 	QDir dir = info.dir();
 
 	if (!dir.exists() && !dir.mkpath(".")) {
-		error = QString("Could not create folder: %1").arg(QDir::toNativeSeparators(dir.absolutePath()));
+		error = T("Warn.CouldNotCreateFolder").arg(QDir::toNativeSeparators(dir.absolutePath()));
 		return false;
 	}
 
@@ -205,7 +212,7 @@ static bool save_image_locally(const QImage &image, const QString &filePath, con
 	writer.setQuality(95);
 
 	if (!writer.write(image)) {
-		error = writer.errorString().isEmpty() ? "Failed to save image locally." : writer.errorString();
+		error = writer.errorString().isEmpty() ? T("Error.LocalSaveGenericFailed") : writer.errorString();
 		return false;
 	}
 
@@ -216,7 +223,7 @@ static bool validate_original_screenshot_cleanup(const QString &originalPath, co
 						 QString &originalClean, QString &error)
 {
 	if (originalPath.trimmed().isEmpty()) {
-		error = "Original OBS screenshot path is empty.";
+		error = T("Error.OriginalPathEmpty");
 		return false;
 	}
 
@@ -225,7 +232,7 @@ static bool validate_original_screenshot_cleanup(const QString &originalPath, co
 								 : QFileInfo(newFilePath).absoluteFilePath();
 
 	if (!newClean.isEmpty() && originalClean.compare(newClean, Qt::CaseInsensitive) == 0) {
-		error = "Refusing to delete the output file because it matches the original screenshot path.";
+		error = T("Error.CleanupPathCollision");
 		return false;
 	}
 
@@ -267,7 +274,7 @@ static bool schedule_original_screenshot_cleanup(const QString &originalPath, co
 		return false;
 
 	if (!g_asyncContext) {
-		error = "Screenshot cleanup service is not available.";
+		error = T("Error.CleanupUnavailable");
 		return false;
 	}
 
@@ -281,12 +288,12 @@ static bool send_to_discord_webhook(const QByteArray &imageBytes, const QString 
 {
 	const QUrl url(g_settings.webhookUrl.trimmed());
 	if (!url.isValid() || url.scheme().isEmpty() || url.host().isEmpty()) {
-		error = "The Discord webhook URL is not valid.";
+		error = T("Error.WebhookUrlInvalid");
 		return false;
 	}
 
 	if (url.scheme().toLower() != "https") {
-		error = "Discord webhook URL must use HTTPS.";
+		error = T("Error.WebhookHttpsRequired");
 		return false;
 	}
 
@@ -297,8 +304,7 @@ static bool send_to_discord_webhook(const QByteArray &imageBytes, const QString 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 1, 0)
 		backends = QSslSocket::availableBackends();
 #endif
-		error = QString("TLS initialization failed. Qt SSL backend is not available. Available backends: %1")
-				.arg(backends.isEmpty() ? QString("(none)") : backends.join(", "));
+		error = T("Error.TlsUnavailable").arg(backends.isEmpty() ? QString("(none)") : backends.join(", "));
 		return false;
 	}
 
@@ -361,7 +367,7 @@ static bool send_to_discord_webhook(const QByteArray &imageBytes, const QString 
 			error += QString(" SSL: %1").arg(sslErrorsText);
 
 		if (error.isEmpty() && status > 0)
-			error = QString("Discord webhook returned HTTP %1.").arg(status);
+			error = T("Error.WebhookHttpStatus").arg(status);
 
 		if (!responseBody.isEmpty())
 			error += QString(" Response: %1").arg(QString::fromUtf8(responseBody));
@@ -396,19 +402,18 @@ static bool capture_obs_image(QImage &image, QString &error)
 	}
 
 	if (!g_screenshotCompleted) {
-		error = "OBS did not finish creating the screenshot within the timeout.";
+		error = T("Error.ScreenshotTimeout");
 		return false;
 	}
 
 	if (g_lastScreenshotPath.trimmed().isEmpty()) {
-		error = "OBS reported screenshot completion but did not return a screenshot path.";
+		error = T("Error.NoScreenshotPath");
 		return false;
 	}
 
 	image = QImage(g_lastScreenshotPath);
 	if (image.isNull()) {
-		error = QString("OBS created a screenshot, but it could not be loaded: %1")
-				.arg(QDir::toNativeSeparators(g_lastScreenshotPath));
+		error = T("Error.ScreenshotLoadFailed").arg(QDir::toNativeSeparators(g_lastScreenshotPath));
 		return false;
 	}
 
@@ -418,8 +423,7 @@ static bool capture_obs_image(QImage &image, QString &error)
 static bool take_and_process_screenshot(QString &resultMessage)
 {
 	if (!format_supported(g_settings.format)) {
-		resultMessage = QString("The selected image format \"%1\" is not supported by this OBS/Qt build.")
-					.arg(g_settings.format);
+		resultMessage = T("Error.UnsupportedFormat").arg(g_settings.format);
 		return false;
 	}
 
@@ -448,12 +452,12 @@ static bool take_and_process_screenshot(QString &resultMessage)
 	if (g_settings.saveLocal) {
 		QString saveError;
 		if (!save_image_locally(image, filePath, g_settings.format, saveError)) {
-			resultMessage = QString("Local save failed: %1").arg(saveError);
+			resultMessage = T("Error.LocalSaveFailed").arg(saveError);
 			return false;
 		}
 
 		didSomething = true;
-		actions << QString("saved to %1").arg(QDir::toNativeSeparators(filePath));
+		actions << T("Status.SavedTo").arg(QDir::toNativeSeparators(filePath));
 	}
 
 	if (!g_settings.webhookUrl.trimmed().isEmpty()) {
@@ -463,8 +467,7 @@ static bool take_and_process_screenshot(QString &resultMessage)
 				: g_settings.format.trimmed().toLower();
 
 		if (!format_supported(webhookFormat)) {
-			resultMessage = QString("The selected webhook image format \"%1\" is not supported.")
-						.arg(webhookFormat);
+			resultMessage = T("Warn.UnsupportedWebhookFormat").arg(webhookFormat);
 			return false;
 		}
 
@@ -476,22 +479,22 @@ static bool take_and_process_screenshot(QString &resultMessage)
 		QByteArray encoded;
 		QString encodeError;
 		if (!encode_image(image, webhookFormat, encoded, encodeError)) {
-			resultMessage = QString("Webhook upload encoding failed: %1").arg(encodeError);
+			resultMessage = T("Error.WebhookEncodeFailed").arg(encodeError);
 			return false;
 	}
 
 		QString webhookError;
 		if (!send_to_discord_webhook(encoded, webhookFileName, g_settings.webhookMessage, webhookError)) {
-			resultMessage = QString("Discord webhook upload failed: %1").arg(webhookError);
+			resultMessage = T("Error.WebhookUploadFailed").arg(webhookError);
 			return false;
 	}
 
 		didSomething = true;
-		actions << QString("sent to Discord webhook as %1").arg(webhookExt.toUpper());
+		actions << T("Status.SentToDiscord").arg(webhookExt.toUpper());
 	}
 
 	if (!didSomething) {
-		resultMessage = "Nothing to do. Enable local save and/or enter a Discord webhook URL.";
+		resultMessage = T("Error.NothingToDo");
 		return false;
 	}
 
@@ -499,14 +502,14 @@ static bool take_and_process_screenshot(QString &resultMessage)
 		QString deleteError;
 		if (!schedule_original_screenshot_cleanup(g_lastScreenshotPath,
 							 g_settings.saveLocal ? filePath : QString(), deleteError)) {
-			resultMessage = QString("Screenshot processed, but cleanup failed: %1").arg(deleteError);
+			resultMessage = T("Error.CleanupFailed").arg(deleteError);
 			return false;
 		}
 
-		actions << "queued original OBS PNG for cleanup";
+		actions << T("Status.QueuedCleanup");
 	}
 
-	resultMessage = QString("Screenshot %1.").arg(actions.join(" and "));
+	resultMessage = T("Status.Screenshot").arg(actions.join(T("Status.Join")));
 	return true;
 }
 
@@ -517,7 +520,7 @@ static void capture_screenshot_now()
 		obs_log(LOG_INFO, "%s", result.toUtf8().constData());
 	} else {
 		obs_log(LOG_WARNING, "%s", result.toUtf8().constData());
-		show_error("Better Screenshot", result);
+		show_error(T("PluginName"), result);
 	}
 }
 
@@ -568,28 +571,57 @@ static void capture_hotkey_callback(void *data, obs_hotkey_id id, obs_hotkey_t *
 	queue_capture_screenshot();
 }
 
-static void save_capture_hotkey(obs_data_t *save_data)
+// Mirrors how OBS itself stores/restores hotkeys in the profile's basic.ini
+// (see OBSBasic::CreateHotkeys / OBSBasicSettings::SaveHotkeySettings) so that
+// bindings set through the Hotkeys UI - or hand-edited into basic.ini, e.g. for
+// keys like Print Screen that OBS's hotkey recorder can't always capture - are
+// respected. A scene-collection-scoped save (the previous approach here) gets
+// reloaded on every collection switch/startup and stomps whatever the profile
+// config holds, which is why bindings appeared to be silently ignored.
+static void save_capture_hotkey_to_profile()
 {
 	if (g_captureHotkeyId == OBS_INVALID_HOTKEY_ID)
 		return;
 
-	obs_data_array_t *hotkeyArray = obs_hotkey_save(g_captureHotkeyId);
-	if (hotkeyArray) {
-		obs_data_set_array(save_data, KEY_CAPTURE_HOTKEY, hotkeyArray);
-		obs_data_array_release(hotkeyArray);
-	}
+	config_t *config = obs_frontend_get_profile_config();
+	if (!config)
+		return;
+
+	obs_data_array_t *bindings = obs_hotkey_save(g_captureHotkeyId);
+	obs_data_t *data = obs_data_create();
+	obs_data_set_array(data, "bindings", bindings);
+
+	config_set_string(config, "Hotkeys", CAPTURE_HOTKEY_NAME, obs_data_get_json(data));
+
+	obs_data_release(data);
+	obs_data_array_release(bindings);
+
+	config_save_safe(config, "tmp", nullptr);
 }
 
-static void load_capture_hotkey(obs_data_t *save_data)
+static void load_capture_hotkey_from_profile()
 {
 	if (g_captureHotkeyId == OBS_INVALID_HOTKEY_ID)
 		return;
 
-	obs_data_array_t *hotkeyArray = obs_data_get_array(save_data, KEY_CAPTURE_HOTKEY);
-	if (hotkeyArray) {
-		obs_hotkey_load(g_captureHotkeyId, hotkeyArray);
-		obs_data_array_release(hotkeyArray);
-	}
+	config_t *config = obs_frontend_get_profile_config();
+	if (!config)
+		return;
+
+	const char *json = config_get_string(config, "Hotkeys", CAPTURE_HOTKEY_NAME);
+	if (!json || !*json)
+		return;
+
+	obs_data_t *data = obs_data_create_from_json(json);
+	if (!data)
+		return;
+
+	obs_data_array_t *bindings = obs_data_get_array(data, "bindings");
+	obs_hotkey_load(g_captureHotkeyId, bindings);
+	if (bindings)
+		obs_data_array_release(bindings);
+
+	obs_data_release(data);
 }
 
 static void settings_save_load_callback(obs_data_t *save_data, bool saving, void *private_data)
@@ -610,8 +642,6 @@ static void settings_save_load_callback(obs_data_t *save_data, bool saving, void
 
 		obs_data_set_obj(save_data, CONFIG_ROOT, obj);
 		obs_data_release(obj);
-
-		save_capture_hotkey(save_data);
 		return;
 	}
 
@@ -652,8 +682,6 @@ static void settings_save_load_callback(obs_data_t *save_data, bool saving, void
 
 	if (g_settings.savePath.isEmpty())
 		g_settings.savePath = default_save_path();
-
-	load_capture_hotkey(save_data);
 }
 
 static void show_settings_dialog(void *private_data)
@@ -667,18 +695,16 @@ static void show_settings_dialog(void *private_data)
 	}
 
 	QDialog dialog(parent);
-	dialog.setWindowTitle("Better Screenshot");
+	dialog.setWindowTitle(T("PluginName"));
 	dialog.setModal(true);
 	dialog.resize(680, 480);
 
 	auto *rootLayout = new QVBoxLayout(&dialog);
 
-	auto *captureGroup = new QGroupBox("Capture");
+	auto *captureGroup = new QGroupBox(T("Dialog.Group.Capture"));
 	auto *captureLayout = new QFormLayout(captureGroup);
 
-	auto *hotkeyInfo = new QLabel(
-		"Background hotkey handling is enabled through OBS hotkeys. Set the shortcut in OBS under <b>File → Settings → Hotkeys</b> using the action "
-		"<b>Better Screenshot: Capture Screenshot</b>.<br><br>");
+	auto *hotkeyInfo = new QLabel(T("Dialog.HotkeyInfo"));
 	hotkeyInfo->setWordWrap(true);
 	hotkeyInfo->setTextFormat(Qt::RichText);
 
@@ -692,38 +718,36 @@ static void show_settings_dialog(void *private_data)
 	}
 
 	captureLayout->addRow(hotkeyInfo);
-	captureLayout->addRow("Image format", formatCombo);
+	captureLayout->addRow(T("Dialog.ImageFormat"), formatCombo);
 
-	auto *localGroup = new QGroupBox("Local save");
+	auto *localGroup = new QGroupBox(T("Dialog.Group.LocalSave"));
 	auto *localLayout = new QGridLayout(localGroup);
 
-	auto *saveLocalCheck = new QCheckBox("Save image locally");
+	auto *saveLocalCheck = new QCheckBox(T("Dialog.SaveLocally"));
 	saveLocalCheck->setChecked(g_settings.saveLocal);
 
-	auto *deleteOriginalCheck = new QCheckBox("Delete original image after save from OBS Recording Path");
+	auto *deleteOriginalCheck = new QCheckBox(T("Dialog.DeleteOriginal"));
 	deleteOriginalCheck->setChecked(g_settings.deleteOriginalAfterSave);
-	deleteOriginalCheck->setToolTip(
-		"Deletes the PNG file generated by OBS after the new image has been processed successfully.");
+	deleteOriginalCheck->setToolTip(T("Dialog.DeleteOriginal.Tooltip"));
 
 	auto *pathEdit = new QLineEdit(g_settings.savePath.isEmpty() ? default_save_path() : g_settings.savePath);
-	auto *browseButton = new QPushButton("Browse...");
+	auto *browseButton = new QPushButton(T("Dialog.Browse"));
 
 	localLayout->addWidget(saveLocalCheck, 0, 0, 1, 3);
 	localLayout->addWidget(deleteOriginalCheck, 1, 0, 1, 3);
-	localLayout->addWidget(new QLabel("Folder"), 2, 0);
+	localLayout->addWidget(new QLabel(T("Dialog.Folder")), 2, 0);
 	localLayout->addWidget(pathEdit, 2, 1);
 	localLayout->addWidget(browseButton, 2, 2);
 
-	auto *discordGroup = new QGroupBox("Discord webhook");
+	auto *discordGroup = new QGroupBox(T("Dialog.Group.Discord"));
 	auto *discordLayout = new QFormLayout(discordGroup);
 
 	auto *webhookEdit = new QLineEdit(g_settings.webhookUrl);
 	webhookEdit->setPlaceholderText("https://discord.com/api/webhooks/...");
 
-	auto *webhookFormatCheck = new QCheckBox("Use separate webhook image format");
+	auto *webhookFormatCheck = new QCheckBox(T("Dialog.WebhookCustomFormat"));
 	webhookFormatCheck->setChecked(g_settings.webhookUseCustomFormat);
-	webhookFormatCheck->setToolTip(
-		"When enabled, Discord uses this format instead of the main local image format.");
+	webhookFormatCheck->setToolTip(T("Dialog.WebhookCustomFormat.Tooltip"));
 
 	auto *webhookFormatCombo = new QComboBox();
 	webhookFormatCombo->addItem("png");
@@ -737,12 +761,12 @@ static void show_settings_dialog(void *private_data)
 	webhookFormatCombo->setEnabled(webhookFormatCheck->isChecked());
 
 	auto *messageEdit = new QPlainTextEdit(g_settings.webhookMessage);
-	messageEdit->setPlaceholderText("Optional message to send with the screenshot");
+	messageEdit->setPlaceholderText(T("Dialog.Message.Placeholder"));
 
-	discordLayout->addRow("Webhook URL", webhookEdit);
+	discordLayout->addRow(T("Dialog.WebhookUrl"), webhookEdit);
 	discordLayout->addRow(webhookFormatCheck);
-	discordLayout->addRow("Webhook image format", webhookFormatCombo);
-	discordLayout->addRow("Message", messageEdit);
+	discordLayout->addRow(T("Dialog.WebhookFormat"), webhookFormatCombo);
+	discordLayout->addRow(T("Dialog.Message"), messageEdit);
 
 	auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
 
@@ -773,7 +797,7 @@ static void show_settings_dialog(void *private_data)
 			startDir = default_save_path();
 
 		const QString folder =
-			QFileDialog::getExistingDirectory(&dialog, "Select screenshot folder", startDir,
+			QFileDialog::getExistingDirectory(&dialog, T("Dialog.SelectFolderTitle"), startDir,
 							  QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
 		if (!folder.isEmpty())
 			pathEdit->setText(folder);
@@ -790,7 +814,7 @@ static void show_settings_dialog(void *private_data)
 			const QString selectedWebhookFormat = webhookFormatCombo->currentText().trimmed().toLower();
 
 			if (saveLocalCheck->isChecked() && selectedPath.isEmpty()) {
-				QMessageBox::warning(&dialog, "Better Screenshot", "Please choose a local folder.");
+				QMessageBox::warning(&dialog, T("PluginName"), T("Warn.ChooseFolder"));
 				return;
 			}
 
@@ -799,8 +823,8 @@ static void show_settings_dialog(void *private_data)
 				QDir dir(effectivePath);
 				if (!dir.exists() && !dir.mkpath(".")) {
 					QMessageBox::warning(
-						&dialog, "Better Screenshot",
-						QString("Could not create folder: %1")
+						&dialog, T("PluginName"),
+						T("Warn.CouldNotCreateFolder")
 							.arg(QDir::toNativeSeparators(dir.absolutePath())));
 					return;
 				}
@@ -809,16 +833,14 @@ static void show_settings_dialog(void *private_data)
 			if (!selectedWebhook.isEmpty()) {
 				const QUrl url(selectedWebhook);
 				if (!url.isValid() || url.scheme().isEmpty() || url.host().isEmpty()) {
-					QMessageBox::warning(&dialog, "Better Screenshot",
-							     "Please enter a valid Discord webhook URL.");
+					QMessageBox::warning(&dialog, T("PluginName"), T("Warn.InvalidWebhookUrl"));
 					return;
 				}
 			}
 
 			if (webhookFormatCheck->isChecked() && !format_supported(selectedWebhookFormat)) {
-				QMessageBox::warning(&dialog, "Better Screenshot",
-					QString("The selected webhook image format \"%1\" is not supported.")
-				    	.arg(selectedWebhookFormat));
+				QMessageBox::warning(&dialog, T("PluginName"),
+					T("Warn.UnsupportedWebhookFormat").arg(selectedWebhookFormat));
 				return;
 			}
 
@@ -843,19 +865,34 @@ static void on_frontend_event(enum obs_frontend_event event, void *private_data)
 {
 	UNUSED_PARAMETER(private_data);
 
-	if (event != OBS_FRONTEND_EVENT_SCREENSHOT_TAKEN)
-		return;
+	switch (event) {
+	case OBS_FRONTEND_EVENT_SCREENSHOT_TAKEN: {
+		char *lastPathRaw = obs_frontend_get_last_screenshot();
+		if (lastPathRaw && *lastPathRaw)
+			g_lastScreenshotPath = QString::fromUtf8(lastPathRaw);
+		else
+			g_lastScreenshotPath.clear();
 
-	char *lastPathRaw = obs_frontend_get_last_screenshot();
-	if (lastPathRaw && *lastPathRaw)
-		g_lastScreenshotPath = QString::fromUtf8(lastPathRaw);
-	else
-		g_lastScreenshotPath.clear();
+		if (lastPathRaw)
+			bfree(lastPathRaw);
 
-	if (lastPathRaw)
-		bfree(lastPathRaw);
-
-	g_screenshotCompleted = true;
+		g_screenshotCompleted = true;
+		break;
+	}
+	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
+	case OBS_FRONTEND_EVENT_PROFILE_CHANGED:
+		// Reload the capture hotkey from the (now current) profile's basic.ini,
+		// same as OBS re-running CreateHotkeys() on profile switch.
+		load_capture_hotkey_from_profile();
+		break;
+	case OBS_FRONTEND_EVENT_EXIT:
+		// Safety net in case the binding changed without going through the
+		// Hotkeys UI (which already persists it to basic.ini itself).
+		save_capture_hotkey_to_profile();
+		break;
+	default:
+		break;
+	}
 }
 
 static void configure_qt_tls_plugin_paths()
@@ -900,12 +937,12 @@ bool obs_module_load(void)
 	if (g_settings.savePath.isEmpty())
 		g_settings.savePath = default_save_path();
 
-	obs_frontend_add_tools_menu_item("Better Screenshot", show_settings_dialog, nullptr);
+	obs_frontend_add_tools_menu_item(obs_module_text("PluginName"), show_settings_dialog, nullptr);
 	obs_frontend_add_save_callback(settings_save_load_callback, nullptr);
 	obs_frontend_add_event_callback(on_frontend_event, nullptr);
 
 	g_captureHotkeyId = obs_hotkey_register_frontend(
-		"better_screenshot.capture", "Better Screenshot: Capture Screenshot", capture_hotkey_callback, nullptr);
+		CAPTURE_HOTKEY_NAME, obs_module_text("Hotkey.Description"), capture_hotkey_callback, nullptr);
 
 	if (g_captureHotkeyId == OBS_INVALID_HOTKEY_ID) {
 		obs_log(LOG_WARNING, "Failed to register Better Screenshot hotkey.");
@@ -913,6 +950,10 @@ bool obs_module_load(void)
 		obs_log(LOG_INFO, "Registered Better Screenshot hotkey id=%llu",
 			static_cast<unsigned long long>(g_captureHotkeyId));
 	}
+
+	// Profile config may not be available yet this early on a cold start; if not,
+	// OBS_FRONTEND_EVENT_FINISHED_LOADING will retry once it is.
+	load_capture_hotkey_from_profile();
 
 	obs_hotkey_enable_background_press(true);
 

@@ -35,9 +35,12 @@ if(ENABLE_QT)
 endif()
 
 if(WIN32 AND ENABLE_QT)
+  # Sits next to the plugin DLL (obs-plugins/64bit/tls/) so
+  # configure_qt_tls_plugin_paths() in plugin-main.cpp can find it via the
+  # module's own directory.
   install(FILES
     "${CMAKE_SOURCE_DIR}/data/obs-studio/bin/64bit/tls/qschannelbackend.dll"
-    DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit/tls"
+    DESTINATION "obs-plugins/64bit/tls"
     OPTIONAL
   )
 endif()
