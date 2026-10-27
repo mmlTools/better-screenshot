@@ -22,15 +22,22 @@ function(set_target_properties_plugin target)
 
   set_target_properties(${target} PROPERTIES VERSION 0 SOVERSION ${PLUGIN_VERSION})
 
-  # OBS looks for plugin modules directly under obs-plugins/64bit (and their
-  # locale/data files under data/obs-plugins/<name>/) rather than the
-  # self-contained "<name>/bin/64bit" package layout, so install there.
-  install(TARGETS ${target} RUNTIME DESTINATION "obs-plugins/64bit" LIBRARY DESTINATION "obs-plugins/64bit")
+  # OBS Studio 33+ third-party plugin layout (see
+  # https://obsproject.com/kb/legacy-plugin-developer-info):
+  #
+  #   <plugins root>/<name>/<name>.dll
+  #   <plugins root>/<name>/data/...
+  #
+  # where <plugins root> is %ProgramData%\obs-studio\plugins (installed OBS)
+  # or <OBS folder>\plugins (portable OBS). The previous layouts
+  # (obs-plugins/64bit in Program Files, and <name>/bin/64bit under
+  # ProgramData) are flagged as "Legacy" by OBS 33 and stop loading in 34.
+  install(TARGETS ${target} RUNTIME DESTINATION "${target}" LIBRARY DESTINATION "${target}")
 
   install(
     FILES "$<TARGET_PDB_FILE:${target}>"
     CONFIGURATIONS RelWithDebInfo Debug Release
-    DESTINATION "obs-plugins/64bit"
+    DESTINATION "${target}"
     OPTIONAL
   )
 
@@ -41,11 +48,11 @@ function(set_target_properties_plugin target)
   add_custom_command(
     TARGET ${target}
     POST_BUILD
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/obs-plugins/64bit"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/${target}"
     COMMAND
       "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:${target}>"
       "$<$<CONFIG:Debug,RelWithDebInfo,Release>:$<TARGET_PDB_FILE:${target}>>"
-      "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/obs-plugins/64bit"
+      "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/${target}"
     COMMENT "Copy ${target} to rundir"
     VERBATIM
   )
@@ -54,7 +61,7 @@ function(set_target_properties_plugin target)
 
   get_target_property(target_sources ${target} SOURCES)
   set(target_ui_files ${target_sources})
-  list(FILTER target_ui_files INCLUDE REGEX ".+\\.(ui|qrc)")
+  list(FILTER target_ui_files INCLUDE REGEX ".+\.(ui|qrc)")
   source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "UI Files" FILES ${target_ui_files})
 
   configure_file(cmake/windows/resources/resource.rc.in "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_PROJECT_NAME}.rc")
@@ -81,7 +88,7 @@ function(target_install_resources target)
 
     install(
       DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data/"
-      DESTINATION "data/obs-plugins/${target}"
+      DESTINATION "${target}/data"
       USE_SOURCE_PERMISSIONS
       PATTERN "obs-studio" EXCLUDE
     )
@@ -89,11 +96,10 @@ function(target_install_resources target)
     add_custom_command(
       TARGET ${target}
       POST_BUILD
-      COMMAND "${CMAKE_COMMAND}" -E make_directory
-        "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/data/obs-plugins/${target}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/${target}/data"
       COMMAND
         "${CMAKE_COMMAND}" -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/data"
-        "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/data/obs-plugins/${target}"
+        "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/${target}/data"
       COMMENT "Copy ${target} resources to rundir"
       VERBATIM
     )
@@ -104,15 +110,13 @@ endfunction()
 function(target_add_resource target resource)
   message(DEBUG "Add resource '${resource}' to target ${target} at destination '${target_destination}'...")
 
-  install(FILES "${resource}" DESTINATION "data/obs-plugins/${target}" COMPONENT Runtime)
+  install(FILES "${resource}" DESTINATION "${target}/data" COMPONENT Runtime)
 
   add_custom_command(
     TARGET ${target}
     POST_BUILD
-    COMMAND "${CMAKE_COMMAND}" -E make_directory
-      "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/data/obs-plugins/${target}"
-    COMMAND "${CMAKE_COMMAND}" -E copy "${resource}"
-      "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/data/obs-plugins/${target}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/${target}/data"
+    COMMAND "${CMAKE_COMMAND}" -E copy "${resource}" "${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>/${target}/data"
     COMMENT "Copy ${target} resource ${resource} to rundir"
     VERBATIM
   )

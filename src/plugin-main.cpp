@@ -957,7 +957,9 @@ bool obs_module_load(void)
 
 	obs_hotkey_enable_background_press(true);
 
-	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
+	const char *modulePath = obs_get_module_file_name(obs_current_module());
+	obs_log(LOG_INFO, "plugin loaded successfully (version %s, OBS %s, Qt %s) from %s", PLUGIN_VERSION,
+		obs_get_version_string(), qVersion(), modulePath ? modulePath : "(unknown path)");
 	return true;
 }
 

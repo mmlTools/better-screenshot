@@ -1,0 +1,166 @@
+name: Release
+run-name: ${{ github.ref_name }} release run 🛫
+on:
+  push:
+    tags:
+      - '*'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  # Publishes the packages produced by the most recent successful "Dispatch"
+  # build of the tagged commit. Nothing is rebuilt here.
+  create-release:
+    name: Create Release 🛫
+    runs-on: ubuntu-26.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check Release Tag ☑️
+        id: check
+        run: |
+          : Check Release Tag ☑️
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          shopt -s extglob
+
+          case "${GITHUB_REF_NAME}" in
+            +([0-9]).+([0-9]).+([0-9]) )
+              echo 'validTag=true' >> $GITHUB_OUTPUT
+              echo 'prerelease=false' >> $GITHUB_OUTPUT
+              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+              ;;
+            +([0-9]).+([0-9]).+([0-9])-@(beta|rc)*([0-9]) )
+              echo 'validTag=true' >> $GITHUB_OUTPUT
+              echo 'prerelease=true' >> $GITHUB_OUTPUT
+              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "::notice::Tag '${GITHUB_REF_NAME}' is not a release tag (expected X.Y.Z or X.Y.Z-beta/rc), skipping release."
+              echo 'validTag=false' >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+          plugin_display_name="$(jq -r '.displayName // .name' buildspec.json)"
+          plugin_version="$(jq -r '.version' buildspec.json)"
+
+          echo "pluginDisplayName=${plugin_display_name}" >> $GITHUB_OUTPUT
+          echo "pluginVersion=${plugin_version}" >> $GITHUB_OUTPUT
+
+          if [[ "${plugin_version}" != "${GITHUB_REF_NAME}" ]]; then
+            echo "::warning::Tag '${GITHUB_REF_NAME}' does not match buildspec.json version '${plugin_version}'. Packages are named after the buildspec version."
+          fi
+
+      - name: Find Dispatched Build 🔎
+        id: build
+        if: fromJSON(steps.check.outputs.validTag)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          : Find Dispatched Build 🔎
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+
+          commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          echo "Looking for a successful Dispatch build of commit ${commit}..."
+
+          run_json="$(gh run list \
+            --workflow dispatch.yaml \
+            --commit "${commit}" \
+            --status success \
+            --limit 50 \
+            --json databaseId,headSha,createdAt,displayTitle \
+            --jq 'sort_by(.createdAt) | last // empty')"
+
+          if [[ -z "${run_json}" ]]; then
+            echo "::error::No successful 'Dispatch' build found for commit ${commit}. Run Actions -> Dispatch -> 'Run workflow' (job: build, config: Release) on this commit first, wait for it to finish, then delete and re-push the tag '${GITHUB_REF_NAME}'."
+            exit 1
+          fi
+
+          run_id="$(jq -r '.databaseId' <<< "${run_json}")"
+          head_sha="$(jq -r '.headSha' <<< "${run_json}")"
+          echo "Using run ${run_id} ($(jq -r '.displayTitle' <<< "${run_json}")) built from ${head_sha}"
+
+          echo "runId=${run_id}" >> $GITHUB_OUTPUT
+          echo "commitHash=${head_sha:0:9}" >> $GITHUB_OUTPUT
+
+      - name: Download Build Artifacts 📥
+        if: fromJSON(steps.check.outputs.validTag)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          : Download Build Artifacts 📥
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+
+          mkdir -p "${GITHUB_WORKSPACE}/artifacts"
+          gh run download "${{ steps.build.outputs.runId }}" --dir "${GITHUB_WORKSPACE}/artifacts"
+          find "${GITHUB_WORKSPACE}/artifacts" -type f
+
+      - name: Rename Files 🏷️
+        if: fromJSON(steps.check.outputs.validTag)
+        run: |
+          : Rename Files 🏷️
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          shopt -s extglob
+          shopt -s nullglob
+
+          root_dir="$(pwd)"
+          commit_hash="${{ steps.build.outputs.commitHash }}"
+
+          variants=(
+            'windows-x64;zip|exe'
+            'macos-universal;tar.xz|pkg'
+            'ubuntu-26.04-x86_64;tar.xz|deb|ddeb'
+            'sources;tar.xz'
+          )
+
+          for variant_data in "${variants[@]}"; do
+            IFS=';' read -r variant suffix <<< "${variant_data}"
+
+            candidates=(artifacts/*-${variant}-${commit_hash}*/*.@(${suffix}))
+
+            for candidate in "${candidates[@]}"; do
+              mv -n "${candidate}" "${root_dir}"
+            done
+          done
+
+          packages=("${root_dir}"/@(*.exe|*.deb|*.ddeb|*.pkg|*.tar.xz|*.zip))
+          if (( ${#packages[@]} == 0 )); then
+            echo "::error::The dispatched build run contains no release packages. Dispatch the build again with config 'Release' and try again."
+            exit 1
+          fi
+          ls -la "${packages[@]}"
+
+      - name: Generate Checksums 🪪
+        if: fromJSON(steps.check.outputs.validTag)
+        run: |
+          : Generate Checksums 🪪
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          shopt -s extglob
+          shopt -s nullglob
+
+          echo "### Checksums" > ${{ github.workspace }}/CHECKSUMS.txt
+          for file in ${{ github.workspace }}/@(*.exe|*.deb|*.ddeb|*.pkg|*.tar.xz|*.zip); do
+            echo "    ${file##*/}: $(sha256sum "${file}" | cut -d " " -f 1)" >> ${{ github.workspace }}/CHECKSUMS.txt
+          done
+
+      - name: Create Release 🛫
+        if: fromJSON(steps.check.outputs.validTag)
+        id: create_release
+        uses: softprops/action-gh-release@9d7c94cfd0a1f3ed45544c887983e9fa900f0564
+        with:
+          draft: true
+          prerelease: ${{ fromJSON(steps.check.outputs.prerelease) }}
+          tag_name: ${{ steps.check.outputs.version }}
+          name: ${{ steps.check.outputs.pluginDisplayName }} ${{ steps.check.outputs.version }}
+          body_path: ${{ github.workspace }}/CHECKSUMS.txt
+          files: |
+            ${{ github.workspace }}/*.exe
+            ${{ github.workspace }}/*.zip
+            ${{ github.workspace }}/*.pkg
+            ${{ github.workspace }}/*.deb
+            ${{ github.workspace }}/*.ddeb
+            ${{ github.workspace }}/*.tar.xz

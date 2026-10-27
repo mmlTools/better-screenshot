@@ -1,5 +1,5 @@
 name: Dispatch
-run-name: Dispatched Repository Actions - ${{ inputs.job }} ⌛️
+run-name: Dispatched Repository Actions - ${{ inputs.job }} (${{ inputs.config }}) ⌛️
 on:
   workflow_dispatch:
     inputs:
@@ -9,10 +9,25 @@ on:
         type: choice
         options:
           - build
+      config:
+        description: Build configuration (use Release for builds that will be published)
+        required: false
+        type: choice
+        default: Release
+        options:
+          - Release
+          - RelWithDebInfo
 permissions:
   contents: write
 jobs:
+  # Builds and packages the plugin for every platform and stores the packages
+  # as workflow artifacts. The Release workflow (triggered by pushing a tag)
+  # picks up the artifacts of the newest successful run for the tagged commit
+  # instead of building again.
   check-and-build:
     if: inputs.job == 'build'
     uses: ./.github/workflows/build-project.yaml
     secrets: inherit
+    with:
+      config: ${{ inputs.config }}
+      package: true
