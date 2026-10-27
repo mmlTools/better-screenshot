@@ -42,7 +42,7 @@
       "generator": "Xcode",
       "cacheVariables": {
         "CMAKE_COMPILE_WARNING_AS_ERROR": true,
-        "ENABLE_CCACHE": true
+        "ENABLE_CCACHE": false
       }
     },
     {

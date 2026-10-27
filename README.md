@@ -3,10 +3,13 @@
 Better Screenshot enhances OBS by allowing flexible screenshot formats, compression, storage, and direct sharing.
 
 ## Features
-- Custom hotkey (Ctrl+Shift+S)
-- Save as PNG, JPG, WEBP
-- Custom save folder
-- Discord webhook integration
+- Captures the program output straight from the OBS renderer (no temporary PNG, nothing blocks the UI)
+- Save as PNG, JPG or WebP with a quality setting for the lossy formats
+- Save to a custom folder or next to your recordings, named with your OBS filename formatting
+- Copy the screenshot to the clipboard
+- Upload to a Discord webhook, optionally in a different format than the local file
+- Single hotkey ("Better Screenshot: Capture Screenshot"), configured in OBS → Settings → Hotkeys
+- Settings are stored per OBS install (shared by all scene collections and profiles); settings from 1.2.x are migrated automatically
 
 ## Requirements
 - OBS Studio **33.0.0 or newer** (plugin 1.3.0 and later).

@@ -4,19 +4,9 @@ include_guard(GLOBAL)
 
 set(CMAKE_XCODE_GENERATE_SCHEME TRUE)
 
-# Use a compiler wrapper to enable ccache in Xcode projects
-if(ENABLE_CCACHE AND CCACHE_PROGRAM)
-  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/resources/ccache-launcher-c.in" ccache-launcher-c)
-  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/resources/ccache-launcher-cxx.in" ccache-launcher-cxx)
-
-  execute_process(
-    COMMAND chmod a+rx "${CMAKE_CURRENT_BINARY_DIR}/ccache-launcher-c" "${CMAKE_CURRENT_BINARY_DIR}/ccache-launcher-cxx"
-  )
-  set(CMAKE_XCODE_ATTRIBUTE_CC "${CMAKE_CURRENT_BINARY_DIR}/ccache-launcher-c")
-  set(CMAKE_XCODE_ATTRIBUTE_CXX "${CMAKE_CURRENT_BINARY_DIR}/ccache-launcher-cxx")
-  set(CMAKE_XCODE_ATTRIBUTE_LD "${CMAKE_C_COMPILER}")
-  set(CMAKE_XCODE_ATTRIBUTE_LDPLUSPLUS "${CMAKE_CXX_COMPILER}")
-endif()
+# Note: no ccache compiler wrapper here. Xcode 26 rejects the wrapped
+# compiler ("conflicting deployment targets"); OBS Studio 33 itself relies on
+# Xcode's own compilation cache instead.
 
 # Set project variables
 set(CMAKE_XCODE_ATTRIBUTE_CURRENT_PROJECT_VERSION ${PLUGIN_BUILD_NUMBER})

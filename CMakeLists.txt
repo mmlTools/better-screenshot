@@ -46,6 +46,18 @@ if(WIN32 AND ENABLE_QT)
   )
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.cpp)
+target_sources(
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE
+    src/plugin-main.cpp
+    src/screenshot-capture.cpp
+    src/screenshot-capture.hpp
+    src/screenshot-service.cpp
+    src/screenshot-service.hpp
+    src/settings-dialog.cpp
+    src/settings-dialog.hpp
+    src/settings.cpp
+    src/settings.hpp
+)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
